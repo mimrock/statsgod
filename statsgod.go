@@ -89,7 +89,7 @@ var graphitePort = flag.Int("graphitePort", 5001, "Graphite Port")
 var flushTime = flag.Duration("flushTime", 10*time.Second, "Flush time")
 var percentile = flag.Int("percentile", 90, "Percentile")
 var listenTCP = flag.Bool("listenTCP", true, "Enable listening on TCP")
-var listenUDP = flag.Bool("ListenUDP", true, "Enable listening on UDP")
+var listenUDP = flag.Bool("listenUDP", true, "Enable listening on UDP")
 
 func main() {
 	// Load command line options.
