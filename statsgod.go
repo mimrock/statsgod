@@ -26,11 +26,13 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -86,6 +88,8 @@ var graphiteHost = flag.String("graphiteHost", "localhost", "Graphite Hostname")
 var graphitePort = flag.Int("graphitePort", 5001, "Graphite Port")
 var flushTime = flag.Duration("flushTime", 10*time.Second, "Flush time")
 var percentile = flag.Int("percentile", 90, "Percentile")
+var listenTCP = flag.Bool("listenTCP", true, "Enable listening on TCP")
+var listenUDP = flag.Bool("ListenUDP", true, "Enable listening on UDP")
 
 func main() {
 	// Load command line options.
@@ -102,13 +106,15 @@ func main() {
 	c := loadConfig(*config)
 	Info.Printf("Loaded Config: %v", c)
 
+	print("ListenTCP:", *listenTCP)
+
+	if (*listenTCP || *listenUDP) == false {
+		Error.Println("At least one of TCP or UDP protocols should be enabled. Stopping.")
+		return
+	}
+
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	Info.Printf("Starting stats server on %s", addr)
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		checkError(err, "Starting Server", true)
-	}
 
 	var store = NewMetricStore()
 
@@ -118,14 +124,43 @@ func main() {
 	// Constantly process background Graphite queue.
 	go handleGraphiteQueue(store)
 
-	for {
-		conn, err := listener.Accept()
-		// TODO: handle errors with one client gracefully.
+	if *listenUDP {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
-			checkError(err, "Accepting Connection", false)
+			checkError(err, "Resolving UDP address", true)
 		}
-		go handleRequest(conn, store)
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			checkError(err, "Listening on UDP", true)
+		}
+		defer udpConn.Close()
+		go handleUDP(udpConn, store)
 	}
+
+	if *listenTCP {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			checkError(err, "Starting TCP listener", true)
+		}
+		defer listener.Close()
+		go func(store *MetricStore) {
+			for {
+				conn, err := listener.Accept()
+				// TODO: handle errors with one client gracefully.
+				if err != nil {
+					checkError(err, "Accepting Connection", false)
+				}
+				go handleTCP(conn, store)
+			}
+		}(store)
+	}
+
+	ch := make(chan os.Signal)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	<-ch
+	Info.Println("Shutting down")
+	// Additional cleanup tasks that cannot be handled by using the defer keyword may be listed here.
+	return
 }
 
 func logInit(
@@ -199,45 +234,70 @@ func loadConfig(c string) map[interface{}]interface{} {
 	return m
 }
 
-func handleRequest(conn net.Conn, store *MetricStore) {
-	for {
-		var metric, val, metricType string
-		buf := make([]byte, 512)
-		_, err := conn.Read(buf)
+func serveRequest(store *MetricStore, buf []byte) (error, bool) {
+	var metric, val, metricType string
+	msg := regexp.MustCompile(`(.*)\:(.*)\|(.*)`)
+	bits := msg.FindAllStringSubmatch(string(buf), 1)
+	if len(bits) != 0 {
+		metric = bits[0][1]
+		val = bits[0][2]
+		tmpMetricType := bits[0][3]
+		tmpMetricType = strings.TrimSpace(tmpMetricType)
+		tmpMetricType = strings.Trim(tmpMetricType, "\x00")
+		metricType, err := shortTypeToLong(tmpMetricType)
+		Trace.Printf("Metric Type Is: %v (~%v)", metricType, tmpMetricType)
 		if err != nil {
-			checkError(err, "Reading Connection", false)
+			Warning.Printf("Problem handling metric of type: %s", tmpMetricType)
+			return err, true
+		}
+	} else {
+		Warning.Printf("Error processing client message: %s", string(buf))
+		return errors.New("Error processing client message."), false
+	}
+
+	// TODO - this float parsing is ugly.
+	value, err := strconv.ParseFloat(val, 32)
+	checkError(err, "Converting Value", false)
+
+	Trace.Printf("(%s) %s => %f", metricType, metric, value)
+
+	store.Set(metric, metricType, float32(value))
+	return nil, true
+}
+
+func handleUDP(conn *net.UDPConn, store *MetricStore) {
+	for {
+		buf := make([]byte, 512)
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			checkError(err, "Reading UDP connection", false)
 			return
 		}
 		defer conn.Close()
 
-		Trace.Printf("Got from client: %s", strings.Trim(string(buf), "\x0a"))
-
-		msg := regexp.MustCompile(`(.*)\:(.*)\|(.*)`)
-		bits := msg.FindAllStringSubmatch(string(buf), 1)
-		if len(bits) != 0 {
-			metric = bits[0][1]
-			val = bits[0][2]
-			tmpMetricType := bits[0][3]
-			tmpMetricType = strings.TrimSpace(tmpMetricType)
-			tmpMetricType = strings.Trim(tmpMetricType, "\x00")
-			metricType, err = shortTypeToLong(tmpMetricType)
-			Trace.Printf("Metric Type Is: %v (~%v)", metricType, tmpMetricType)
-			if err != nil {
-				Warning.Printf("Problem handling metric of type: %s", tmpMetricType)
-				continue
-			}
-		} else {
-			Warning.Printf("Error processing client message: %s", string(buf))
+		Trace.Printf("Got '%s' from UDP client: %s", string(buf[0:n]), addr)
+		_, connectionOk := serveRequest(store, buf)
+		if !connectionOk {
 			return
 		}
+	}
+}
 
-		// TODO - this float parsing is ugly.
-		value, err := strconv.ParseFloat(val, 32)
-		checkError(err, "Converting Value", false)
+func handleTCP(conn net.Conn, store *MetricStore) {
+	for {
+		buf := make([]byte, 512)
+		_, err := conn.Read(buf)
+		if err != nil {
+			checkError(err, "Reading TCP connection", false)
+			return
+		}
+		defer conn.Close()
 
-		Trace.Printf("(%s) %s => %f", metricType, metric, value)
-
-		store.Set(metric, metricType, float32(value))
+		Trace.Printf("Got from TCP client: %s", strings.Trim(string(buf), "\x0a"))
+		_, connectionOk := serveRequest(store, buf)
+		if !connectionOk {
+			return
+		}
 	}
 }
 
@@ -413,7 +473,7 @@ func (s *MetricStore) Set(key string, metricType string, val float32) bool {
 func sendSingleMetricToGraphite(key string, v float32, t string) {
 	c, err := net.Dial("tcp", fmt.Sprintf("%s:%d", *graphiteHost, *graphitePort))
 	if err != nil {
-		Error.Println("Could not connect to remote graphite server")
+		Error.Println("Could not connect to remote graphite server: ", err.Error())
 		return
 	}
 
