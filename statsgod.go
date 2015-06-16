@@ -106,8 +106,6 @@ func main() {
 	c := loadConfig(*config)
 	Info.Printf("Loaded Config: %v", c)
 
-	print("ListenTCP:", *listenTCP)
-
 	if (*listenTCP || *listenUDP) == false {
 		Error.Println("At least one of TCP or UDP protocols should be enabled. Stopping.")
 		return
