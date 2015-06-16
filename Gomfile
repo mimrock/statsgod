@@ -4,6 +4,6 @@ gom 'gopkg.in/yaml.v1'
 group :test do
   gom 'gopkg.in/check.v1'
   gom 'github.com/golang/lint/golint'
-  gom 'code.google.com/p/go.tools/cmd/vet'
-  gom 'code.google.com/p/go.tools/cmd/cover'
+  gom 'golang.org/x/tools/cmd/vet'
+  gom 'golang.org/x/tools/cmd/cover'
 end
